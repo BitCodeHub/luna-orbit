@@ -17,8 +17,8 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "luna-orbit": "./dist/cli.js",
-    "orbit": "./dist/cli.js"
+    "luna-orbit": "dist/cli.js",
+    "orbit": "dist/cli.js"
   },
   "exports": {
     ".": {
