@@ -39,8 +39,10 @@ Usage:
   luna-orbit serve   [--port N] [--data-dir DIR] [--max-parallel N]
                                                  # HTTP API + dashboard (+ scheduler if any plan has cron:)
   luna-orbit monitor <plans-dir> [--port N]      # alias for serve that auto-loads plans for cron scheduling
-  luna-orbit record  --target <URL> --save <plan.md>           [v0.4 — coming soon]
-  luna-orbit run-changed --base main [--plans <dir>]           [v0.4 — coming soon]
+  luna-orbit backup  [--data-dir DIR] [--out luna-backup.tar.gz]
+                                                 # consistent snapshot of the SaaS DB + per-run files
+  luna-orbit record  --target <URL> --save <plan.md>           [v0.5 — coming soon]
+  luna-orbit run-changed --base main [--plans <dir>]           [v0.5 — coming soon]
   orbit run <plan.md>                            # short alias
 
 Env vars:
@@ -195,9 +197,42 @@ async function main() {
   if (cmd === "auto") return cmdAuto(rest);
   if (cmd === "login") return cmdLogin(rest);
   if (cmd === "monitor") return cmdMonitor(rest);
+  if (cmd === "backup") return cmdBackup(rest);
   if (cmd === "record") return v04Stub("record");
   if (cmd === "run-changed") return v04Stub("run-changed");
   usage();
+}
+
+async function cmdBackup(argv: string[]) {
+  const dataDir = flagValue(argv, "--data-dir") ?? process.env.LUNA_ORBIT_DATA_DIR ?? "./orbit-data";
+  const out = flagValue(argv, "--out") ?? `./luna-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.tar.gz`;
+  const { existsSync } = await import("node:fs");
+  const path = await import("node:path");
+  const dbPath = path.join(dataDir, "luna.db");
+  if (!existsSync(dbPath)) {
+    console.error(`luna-orbit backup: no database found at ${dbPath}`);
+    process.exit(1);
+  }
+  // SQLite VACUUM INTO produces a consistent snapshot even with the server running.
+  const Database = (await import("better-sqlite3")).default;
+  const snapshot = path.join(dataDir, ".luna.snapshot.db");
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    if (existsSync(snapshot)) await (await import("node:fs/promises")).unlink(snapshot).catch(() => undefined);
+    // SQLite parses double-quoted strings as identifiers — must use single quotes,
+    // and escape any embedded single quotes by doubling them.
+    db.exec(`VACUUM INTO '${snapshot.replace(/'/g, "''")}'`);
+  } finally { db.close(); }
+
+  // Tar everything we care about: snapshot DB + per-run files. Use system tar
+  // for portability (works on macOS bsdtar + GNU tar identically for this use).
+  const { spawn } = await import("node:child_process");
+  await new Promise<void>((resolve, reject) => {
+    const proc = spawn("tar", ["-czf", out, "-C", dataDir, ".luna.snapshot.db", "runs"], { stdio: "inherit" });
+    proc.on("close", (code) => code === 0 ? resolve() : reject(new Error(`tar exit ${code}`)));
+  });
+  await (await import("node:fs/promises")).unlink(snapshot).catch(() => undefined);
+  console.log(`\nbackup written → ${out}`);
 }
 
 main().catch((e) => {

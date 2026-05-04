@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   name          TEXT,
   created_at    TEXT NOT NULL,
-  default_workspace_id TEXT
+  default_workspace_id TEXT,
+  email_verified_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -80,10 +81,48 @@ CREATE TABLE IF NOT EXISTS runs (
   FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS auth_tokens (
+  token_hash TEXT PRIMARY KEY,            -- sha256 of the raw token in the email link
+  user_id    TEXT NOT NULL,
+  kind       TEXT NOT NULL,               -- 'verify_email' | 'password_reset'
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  used_at    TEXT,                        -- null until consumed
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS csrf_tokens (
+  token_hash  TEXT PRIMARY KEY,            -- sha256 of the raw form token
+  session_hash TEXT NOT NULL,              -- session this token is bound to
+  created_at  TEXT NOT NULL,
+  expires_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS signup_attempts (
+  ip          TEXT NOT NULL,
+  attempted_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_runs_workspace_queued ON runs(workspace_id, queued_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_keys_workspace ON api_keys(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_csrf_session ON csrf_tokens(session_hash);
+CREATE INDEX IF NOT EXISTS idx_signup_attempts_ip ON signup_attempts(ip, attempted_at);
 `;
+
+/**
+ * Schema migration helper — adds columns or tables that may be missing
+ * from databases created by an earlier version. Runs idempotently on
+ * every server start. Safer than ALTER because we only add, never drop.
+ */
+export function migrateSchema(db: ReturnType<typeof openDb>): void {
+  // Add email_verified_at to existing users tables (v0.4.0 → v0.4.1).
+  const cols = db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "email_verified_at")) {
+    db.exec("ALTER TABLE users ADD COLUMN email_verified_at TEXT");
+  }
+}
 
 let _db: DB | null = null;
 
@@ -93,6 +132,7 @@ export function openDb(dataDir: string): DB {
   const path = join(dataDir, "luna.db");
   _db = new Database(path);
   _db.exec(SCHEMA);
+  migrateSchema(_db);
   return _db;
 }
 

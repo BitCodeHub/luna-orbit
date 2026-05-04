@@ -48,8 +48,11 @@ import { SESSION_COOKIE } from "./auth.js";
 import {
   createUser, authenticate, createSession, userFromSession, deleteSession,
   getWorkspace, userInWorkspace, listApiKeys, createApiKey, revokeApiKey, workspaceFromApiKey,
+  issueAuthToken, consumeAuthToken, markEmailVerified, isEmailVerified, userByEmail, setPassword,
+  issueCsrfToken, consumeCsrfToken, tryRecordSignupAttempt,
   type UserRow, type WorkspaceRow,
 } from "./users.js";
+import { sendEmail } from "./email.js";
 import { PLANS, refreshUsage, enforceRunQuota, bumpUsage } from "./billing.js";
 import { renderPage, esc } from "./pages.js";
 import { renderWidgetJs } from "./widget.js";
@@ -230,13 +233,40 @@ export function createServer(opts: ServerOptions) {
   app.get("/signup", () => renderPage("Sign up · Luna Orbit", authPageHtml("signup")));
   app.get("/login", () => renderPage("Log in · Luna Orbit", authPageHtml("login")));
 
+  function clientIp(c: Context): string {
+    return c.req.header("x-forwarded-for")?.split(",")[0]?.trim()
+        || c.req.header("x-real-ip")
+        || "0.0.0.0";
+  }
+
+  function makeVerificationLink(rawToken: string): string {
+    const base = (opts.publicBaseUrl ?? "").replace(/\/$/, "");
+    return `${base}/verify?token=${encodeURIComponent(rawToken)}`;
+  }
+  function makeResetLink(rawToken: string): string {
+    const base = (opts.publicBaseUrl ?? "").replace(/\/$/, "");
+    return `${base}/reset?token=${encodeURIComponent(rawToken)}`;
+  }
+
   app.post("/signup", async (c) => {
+    const ip = clientIp(c);
+    if (!tryRecordSignupAttempt(db, ip)) {
+      return renderPage("Sign up · Luna Orbit", authPageHtml("signup", "Too many signups from your network. Try again later."));
+    }
     const f = await c.req.parseBody();
     const email = String(f.email ?? "").trim();
     const password = String(f.password ?? "");
     const name = String(f.name ?? "").trim() || undefined;
     try {
       const { user } = await createUser(db, email, password, name);
+      // Fire-and-forget the verification email. Self-host = printed to stdout.
+      const verifyToken = issueAuthToken(db, user.id, "verify_email");
+      void sendEmail({
+        to: user.email,
+        subject: "Verify your Luna Orbit email",
+        text: `Hi ${name ?? "there"},\n\nClick this link to verify your email and finish signup:\n\n${makeVerificationLink(verifyToken)}\n\nThe link expires in 24 hours.`,
+      }).catch((e) => console.error("[email] verification send failed:", (e as Error).message));
+
       const token = createSession(db, user.id, c.req.header("user-agent"));
       setCookie(c, SESSION_COOKIE, token, { httpOnly: true, sameSite: "Lax", path: "/", maxAge: 30 * 24 * 3600, secure: c.req.header("x-forwarded-proto") === "https" });
       return c.redirect("/onboarding", 303);
@@ -263,6 +293,54 @@ export function createServer(opts: ServerOptions) {
     return c.redirect("/", 303);
   });
 
+  // ── Email verification ────────────────────────────────────────────
+  app.get("/verify", async (c) => {
+    const token = c.req.query("token") ?? "";
+    const userId = consumeAuthToken(db, token, "verify_email");
+    if (!userId) {
+      return renderPage("Verify · Luna Orbit", `<header class="hdr"><h1>Link expired or invalid</h1></header><div class="card"><p>This verification link is no longer valid. <a href="/login">Log in</a> and request a new one from your settings.</p></div>`);
+    }
+    markEmailVerified(db, userId);
+    return renderPage("Verified · Luna Orbit", `<header class="hdr"><h1>Email verified ✓</h1></header><div class="card"><p>Your email is verified. You can <a href="/">go to your dashboard</a>.</p></div>`);
+  });
+
+  // ── Forgot password ──────────────────────────────────────────────
+  app.get("/forgot", () => renderPage("Forgot password · Luna Orbit", forgotPageHtml()));
+  app.post("/forgot", async (c) => {
+    const f = await c.req.parseBody();
+    const email = String(f.email ?? "").trim();
+    const user = userByEmail(db, email);
+    // Always show the same success page — don't leak whether the email exists.
+    if (user) {
+      const token = issueAuthToken(db, user.id, "password_reset");
+      void sendEmail({
+        to: user.email,
+        subject: "Reset your Luna Orbit password",
+        text: `Click this link to set a new password (valid for 1 hour):\n\n${makeResetLink(token)}\n\nIf you didn't ask for a reset, ignore this email.`,
+      }).catch((e) => console.error("[email] reset send failed:", (e as Error).message));
+    }
+    return renderPage("Forgot password · Luna Orbit", `<header class="hdr"><h1>Check your email</h1></header><div class="card"><p>If an account exists for <strong>${esc(email)}</strong>, a reset link has been sent. The link is valid for 1 hour.</p></div>`);
+  });
+
+  // ── Reset password ───────────────────────────────────────────────
+  app.get("/reset", (c) => {
+    const token = c.req.query("token") ?? "";
+    return renderPage("Reset password · Luna Orbit", resetPageHtml(token));
+  });
+  app.post("/reset", async (c) => {
+    const f = await c.req.parseBody();
+    const token = String(f.token ?? "");
+    const password = String(f.password ?? "");
+    const userId = consumeAuthToken(db, token, "password_reset");
+    if (!userId) return renderPage("Reset password · Luna Orbit", `<header class="hdr"><h1>Link expired or invalid</h1></header><div class="card"><p>Reset links last 1 hour. <a href="/forgot">Request a new one</a>.</p></div>`);
+    try {
+      await setPassword(db, userId, password);
+    } catch (e) {
+      return renderPage("Reset password · Luna Orbit", resetPageHtml(token, (e as Error).message));
+    }
+    return renderPage("Reset password · Luna Orbit", `<header class="hdr"><h1>Password updated ✓</h1></header><div class="card"><p>You can <a href="/login">log in</a> with your new password.</p></div>`);
+  });
+
   // ── Onboarding (first-run wizard for non-tech users) ──────────────
   app.get("/onboarding", async (c) => {
     const ctx = await sessionCtxFromCookie(c);
@@ -280,13 +358,43 @@ export function createServer(opts: ServerOptions) {
     };
   }
 
+  /**
+   * CSRF middleware — applied to authed POST routes that perform
+   * state-changing actions on behalf of a user (key management, run
+   * creation, logout). The token is one-shot: issued by GET handlers
+   * via csrfFor(c), embedded in the form, consumed on POST.
+   */
+  function requireCsrf() {
+    return async (c: Context, next: () => Promise<unknown>) => {
+      const sess = getCookie(c, SESSION_COOKIE);
+      if (!sess) return c.text("session required", 401);
+      const f = await c.req.parseBody();
+      const tok = String(f._csrf ?? "");
+      if (!consumeCsrfToken(db, sess, tok)) {
+        return c.text("CSRF token missing or invalid — refresh the page and try again.", 403);
+      }
+      // Stash the parsed body so handlers don't have to re-parse.
+      c.set("formBody" as never, f);
+      return next();
+    };
+  }
+
+  /** Issue a fresh CSRF token bound to the current session, for embedding in a form. */
+  function csrfFor(c: Context): string {
+    const sess = getCookie(c, SESSION_COOKIE) ?? "";
+    return sess ? issueCsrfToken(db, sess) : "";
+  }
+  function csrfInput(c: Context): string {
+    return `<input type="hidden" name="_csrf" value="${csrfFor(c)}"/>`;
+  }
+
   app.get("/new", requireSession(), async (c) => {
-    return renderPage("New run · Luna Orbit", newRunFormHtml());
+    return renderPage("New run · Luna Orbit", newRunFormHtml(csrfFor(c)));
   });
 
-  app.post("/new", requireSession(), async (c) => {
+  app.post("/new", requireSession(), requireCsrf(), async (c) => {
     const ctx = c.get("session" as never) as SessionCtx;
-    const f = await c.req.parseBody();
+    const f = c.get("formBody" as never) as Record<string, unknown>;
     const mode = String(f.mode ?? "auto");
     try {
       let id: string;
@@ -320,12 +428,13 @@ export function createServer(opts: ServerOptions) {
     const keys = listApiKeys(db, ctx.workspace.id);
     const usage = refreshUsage(db, ctx.workspace);
     const reveal = c.req.query("reveal");
-    return renderPage("Settings · Luna Orbit", settingsHtml(ctx, keys, usage, reveal));
+    const verified = isEmailVerified(db, ctx.user.id);
+    return renderPage("Settings · Luna Orbit", settingsHtml(ctx, keys, usage, csrfFor(c), verified, reveal));
   });
 
-  app.post("/settings/api-keys", requireSession(), async (c) => {
+  app.post("/settings/api-keys", requireSession(), requireCsrf(), async (c) => {
     const ctx = c.get("session" as never) as SessionCtx;
-    const f = await c.req.parseBody();
+    const f = c.get("formBody" as never) as Record<string, unknown>;
     const name = String(f.name ?? "").trim() || "Untitled key";
     const planLimit = PLANS[ctx.workspace.plan].api_keys;
     if (planLimit !== -1 && listApiKeys(db, ctx.workspace.id).length >= planLimit) {
@@ -335,10 +444,23 @@ export function createServer(opts: ServerOptions) {
     return c.redirect(`/settings?reveal=${encodeURIComponent(full)}`, 303);
   });
 
-  app.post("/settings/api-keys/:id/revoke", requireSession(), async (c) => {
+  app.post("/settings/api-keys/:id/revoke", requireSession(), requireCsrf(), async (c) => {
     const ctx = c.get("session" as never) as SessionCtx;
     const id = c.req.param("id");
     if (id) revokeApiKey(db, ctx.workspace.id, id);
+    return c.redirect("/settings", 303);
+  });
+
+  /** Resend the verification email — for users who lost it. */
+  app.post("/settings/resend-verification", requireSession(), requireCsrf(), async (c) => {
+    const ctx = c.get("session" as never) as SessionCtx;
+    if (isEmailVerified(db, ctx.user.id)) return c.redirect("/settings", 303);
+    const tok = issueAuthToken(db, ctx.user.id, "verify_email");
+    void sendEmail({
+      to: ctx.user.email,
+      subject: "Verify your Luna Orbit email",
+      text: `Click this link to verify your email (valid 24h):\n\n${makeVerificationLink(tok)}`,
+    }).catch((e) => console.error("[email] resend failed:", (e as Error).message));
     return c.redirect("/settings", 303);
   });
 
@@ -522,7 +644,9 @@ function landingHtml(publicBaseUrl?: string): string {
 function authPageHtml(mode: "signup" | "login", error?: string): string {
   const title = mode === "signup" ? "Create your account" : "Log in";
   const cta = mode === "signup" ? "Sign up" : "Log in";
-  const other = mode === "signup" ? `<a href="/login">Already have an account? Log in</a>` : `<a href="/signup">Don't have an account? Sign up free</a>`;
+  const other = mode === "signup"
+    ? `<a href="/login">Already have an account? Log in</a>`
+    : `<a href="/signup">Don't have an account? Sign up free</a> · <a href="/forgot">Forgot password?</a>`;
   return `
     <header class="hdr"><a href="/" style="text-decoration:none;color:inherit"><h1>Luna Orbit</h1></a></header>
     <div class="card" style="max-width:420px;margin:0 auto">
@@ -535,6 +659,36 @@ function authPageHtml(mode: "signup" | "login", error?: string): string {
         <button type="submit" class="btn primary" style="width:100%;justify-content:center;margin-top:8px">${cta}</button>
       </form>
       <p style="margin:18px 0 0;text-align:center;font-size:13px">${other}</p>
+    </div>
+  `;
+}
+
+function forgotPageHtml(): string {
+  return `
+    <header class="hdr"><a href="/" style="text-decoration:none;color:inherit"><h1>Luna Orbit</h1></a></header>
+    <div class="card" style="max-width:420px;margin:0 auto">
+      <h2 style="margin-top:0;text-transform:none;font-size:18px;color:#111827;letter-spacing:0">Forgot your password?</h2>
+      <p style="font-size:13px;color:#6b7280;margin-top:0">Enter your email — we'll send a reset link valid for 1 hour.</p>
+      <form method="POST" action="/forgot">
+        <label>Email<input type="email" name="email" required autocomplete="email"/></label>
+        <button type="submit" class="btn primary" style="width:100%;justify-content:center">Send reset link</button>
+      </form>
+      <p style="margin:18px 0 0;text-align:center;font-size:13px"><a href="/login">← back to log in</a></p>
+    </div>
+  `;
+}
+
+function resetPageHtml(token: string, error?: string): string {
+  return `
+    <header class="hdr"><a href="/" style="text-decoration:none;color:inherit"><h1>Luna Orbit</h1></a></header>
+    <div class="card" style="max-width:420px;margin:0 auto">
+      <h2 style="margin-top:0;text-transform:none;font-size:18px;color:#111827;letter-spacing:0">Set a new password</h2>
+      ${error ? `<div style="background:#fee2e2;color:#991b1b;padding:10px 12px;border-radius:6px;font-size:13px;margin-bottom:14px">${esc(error)}</div>` : ""}
+      <form method="POST" action="/reset">
+        <input type="hidden" name="token" value="${esc(token)}"/>
+        <label>New password <span class="hint">(8+ characters)</span><input type="password" name="password" required minlength="8" autocomplete="new-password" autofocus/></label>
+        <button type="submit" class="btn primary" style="width:100%;justify-content:center">Set password</button>
+      </form>
     </div>
   `;
 }
@@ -570,7 +724,7 @@ function dashboardHtml(ctx: { user: UserRow; workspace: WorkspaceRow }, recent: 
   `;
 }
 
-function newRunFormHtml(): string {
+function newRunFormHtml(csrf: string): string {
   return `
     <header class="hdr"><h1>New run</h1><a class="btn ghost" href="/">← all runs</a></header>
     <div class="tabs">
@@ -578,6 +732,7 @@ function newRunFormHtml(): string {
       <button class="tab" data-tab="plan">Use existing plan</button>
     </div>
     <form method="POST" action="/new" class="card">
+      <input type="hidden" name="_csrf" value="${esc(csrf)}"/>
       <input type="hidden" name="mode" id="mode" value="auto"/>
       <div data-pane="auto">
         <label>Target URL <span class="hint">(the website you want to test)</span><input type="url" name="target" placeholder="https://your-app.com" required/></label>
@@ -663,20 +818,29 @@ function runDetailHtml(r: RunRecord): string {
   `;
 }
 
-function settingsHtml(ctx: { user: UserRow; workspace: WorkspaceRow }, keys: Array<{ id: string; name: string; created_at: string; last_used_at: string | null }>, usage: { used: number; limit: number }, reveal?: string): string {
+function settingsHtml(ctx: { user: UserRow; workspace: WorkspaceRow }, keys: Array<{ id: string; name: string; created_at: string; last_used_at: string | null }>, usage: { used: number; limit: number }, csrf: string, verified: boolean, reveal?: string): string {
   const keyRows = keys.map((k) => `
     <tr>
       <td><code>${esc(k.id)}</code></td>
       <td>${esc(k.name)}</td>
       <td>${k.last_used_at ?? "<span class=\"meta\">never</span>"}</td>
       <td>${k.created_at.slice(0, 10)}</td>
-      <td><form method="POST" action="/settings/api-keys/${esc(k.id)}/revoke" onsubmit="return confirm('Revoke this key? Anything using it stops working.')"><button type="submit" class="btn ghost" style="color:#991b1b">Revoke</button></form></td>
+      <td><form method="POST" action="/settings/api-keys/${esc(k.id)}/revoke" onsubmit="return confirm('Revoke this key? Anything using it stops working.')"><input type="hidden" name="_csrf" value="${esc(csrf)}"/><button type="submit" class="btn ghost" style="color:#991b1b">Revoke</button></form></td>
     </tr>`).join("") || `<tr><td colspan="5" class="empty">No API keys yet.</td></tr>`;
   return `
     <header class="hdr">
       <div><h1>Settings</h1><div class="meta"><a href="/">← all runs</a> · ${esc(ctx.user.email)}</div></div>
       <form method="POST" action="/logout"><button class="btn ghost" type="submit">Log out</button></form>
     </header>
+
+    ${!verified ? `<div class="card" style="background:#fef3c7;border-color:#fbbf24">
+      <h3 style="margin-top:0;color:#92400e">Verify your email</h3>
+      <p style="font-size:13px;margin:0 0 12px">We sent a verification link to <strong>${esc(ctx.user.email)}</strong>. Click it to confirm your address.</p>
+      <form method="POST" action="/settings/resend-verification" style="display:inline">
+        <input type="hidden" name="_csrf" value="${esc(csrf)}"/>
+        <button class="btn" type="submit">Resend verification email</button>
+      </form>
+    </div>` : ""}
 
     ${reveal ? `<div class="card" style="background:#dcfce7;border-color:#86efac">
       <h3 style="margin-top:0;color:#166534">Your new API key — copy it now, it won't be shown again</h3>
@@ -693,6 +857,7 @@ function settingsHtml(ctx: { user: UserRow; workspace: WorkspaceRow }, keys: Arr
       <h3 style="margin-top:0">API keys</h3>
       <p style="font-size:13px;color:#6b7280;margin-top:0">Use these to trigger runs from CI or your own services. Each key has access to <strong>all</strong> data in this workspace.</p>
       <form method="POST" action="/settings/api-keys" style="display:flex;gap:8px;margin-bottom:16px">
+        <input type="hidden" name="_csrf" value="${esc(csrf)}"/>
         <input type="text" name="name" placeholder="key name (e.g. 'CI', 'GitHub Actions')" style="flex:1;padding:8px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:13px"/>
         <button type="submit" class="btn primary">+ Generate key</button>
       </form>
