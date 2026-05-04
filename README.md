@@ -1,5 +1,8 @@
 # Luna Orbit
 
+[![CI](https://github.com/BitCodeHub/luna-orbit/actions/workflows/ci.yml/badge.svg)](https://github.com/BitCodeHub/luna-orbit/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **AI-native regression testing. You describe what to test. Luna writes the test plan AND runs it.**
 
 ```bash
