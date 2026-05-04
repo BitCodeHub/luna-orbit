@@ -1,0 +1,51 @@
+{
+  "name": "luna-orbit",
+  "version": "0.1.0",
+  "description": "Luna Orbit — AI-powered autonomous regression testing SDK. Drop into any web app (Playwright) or mobile app (Appium). Describe flows in plain English, the agent drives a real browser/device, self-heals, screenshots, and reports.",
+  "license": "MIT",
+  "keywords": [
+    "regression-testing",
+    "e2e",
+    "ai-testing",
+    "autonomous-testing",
+    "playwright",
+    "appium",
+    "self-healing",
+    "luna-orbit"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "luna-orbit": "./dist/cli.js",
+    "orbit": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "plans", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "orbit": "node dist/cli.js",
+    "prepublishOnly": "npm run clean && npm run build && npm run test"
+  },
+  "dependencies": {
+    "agent-browser": "^0.26.0",
+    "webdriverio": "^9.0.0",
+    "hono": "^4.6.0",
+    "@hono/node-server": "^1.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.0"
+  }
+}

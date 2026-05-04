@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.log
+.env
+.env.local
+
+# Run output (per-run screenshots + reports)
+orbit-out/
+orbit-out-*/
+qa-out/
+qa-out-*/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
