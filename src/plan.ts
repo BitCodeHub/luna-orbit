@@ -44,6 +44,23 @@ export interface Plan {
   assertions: string[];
   /** Original source path (for the report). */
   sourcePath?: string;
+
+  // ── v0.3 additions (each maps 1:1 to a feature in the gap matrix) ──
+
+  /** Schedule expression — `every 15m`, `every 6h`, or 5-field cron. Used by `luna-orbit monitor` / scheduler in `serve`. */
+  cron?: string;
+  /** Path to an auth fixture JSON (cookies + localStorage captured via `luna-orbit login`). Loaded into the browser before the run starts. */
+  auth?: string;
+  /** Auto-retry the whole run on failure. Default 0 (no retry). Set 1-3 to fight transient flake. The flake module attaches an LLM-written diagnosis when retries differ. */
+  retry?: number;
+  /** Run axe-core after the final intent and fail the run on serious violations. v0.3 = LLM evaluates from the snapshot; v0.4 = real axe-core injection. */
+  a11y?: boolean;
+  /** Browsers to run against in parallel. v0.3 honours only the first; v0.4 = full matrix via Playwright BrowserType. */
+  browsers?: string[];
+  /** Visual regression — path (or directory) of baseline screenshots to compare against using LLM vision. */
+  visualBaseline?: string;
+  /** Parameter matrix — same plan run once per combination. v0.3 stub: parsed but not yet expanded. v0.4 = LLM generates variations + each runs as a separate report. */
+  params?: Record<string, string[]>;
 }
 
 const FRONTMATTER_RE = /^---\s*\n([\s\S]+?)\n---\s*\n/;
@@ -54,7 +71,7 @@ function parseFrontmatter(src: string): { meta: Record<string, string>; body: st
   const meta: Record<string, string> = {};
   const block = m[1] ?? "";
   for (const line of block.split("\n")) {
-    const kv = line.match(/^\s*([a-z_]+)\s*:\s*(.+?)\s*$/i);
+    const kv = line.match(/^\s*([a-z][a-z0-9_]*)\s*:\s*(.+?)\s*$/i);
     if (kv && kv[1] && kv[2]) meta[kv[1]] = kv[2];
   }
   return { meta, body: src.slice(m[0].length) };
@@ -90,6 +107,16 @@ export function parsePlan(src: string, sourcePath?: string): Plan {
       throw new Error(`plan: \`capabilities:\` must be a valid JSON object on a single line. Got: ${meta.capabilities.slice(0, 80)}`);
     }
   }
+  let params: Record<string, string[]> | undefined;
+  if (meta.params) {
+    try {
+      const parsed = JSON.parse(meta.params);
+      if (parsed && typeof parsed === "object") params = parsed as Record<string, string[]>;
+    } catch {
+      throw new Error(`plan: \`params:\` must be valid JSON like {"name":["alice","bob"]}. Got: ${meta.params.slice(0, 80)}`);
+    }
+  }
+  const browsers = meta.browsers ? meta.browsers.split(/\s*,\s*/).filter(Boolean) : undefined;
   return {
     name: meta.name,
     target: meta.target ?? "",
@@ -103,6 +130,13 @@ export function parsePlan(src: string, sourcePath?: string): Plan {
     intents,
     assertions,
     sourcePath,
+    cron: meta.cron,
+    auth: meta.auth,
+    retry: meta.retry ? Math.max(0, Math.min(5, Number(meta.retry))) : 0,
+    a11y: meta.a11y === "true",
+    browsers,
+    visualBaseline: meta.visual_baseline,
+    params,
   };
 }
 

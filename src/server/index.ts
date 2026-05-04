@@ -26,8 +26,10 @@ import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { readFile, writeFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { runPlanFromString, type RunReport } from "../index.js";
+import { runPlanFromString, type EnrichedReport } from "../index.js";
+import { parsePlan } from "../plan.js";
 import { authorPlan } from "../author.js";
+import { parseSchedule, createScheduler } from "../scheduling.js";
 import { RunRegistry, type RunRecord } from "./runs.js";
 import { Queue } from "./queue.js";
 import { fireWebhooks } from "./webhooks.js";
@@ -42,6 +44,8 @@ export interface ServerOptions {
   webhookUrls: string[];
   /** Optional shared secret — sent as `x-luna-orbit-signature: sha256=...`. */
   webhookSecret?: string;
+  /** Directory of plan markdown files. Plans with `cron:` in frontmatter get auto-scheduled. */
+  plansDir?: string;
 }
 
 export function createServer(opts: ServerOptions) {
@@ -77,8 +81,9 @@ export function createServer(opts: ServerOptions) {
     void queue.run(async () => {
       await registry.update(id, { status: "running", started_at: new Date().toISOString() });
       let final: RunRecord | null = null;
+      let report: EnrichedReport | null = null;
       try {
-        const report: RunReport = await runPlanFromString(planMd, {
+        report = await runPlanFromString(planMd, {
           outDir: registry.runDir(id),
           headed: runOpts.headed,
         });
@@ -90,7 +95,7 @@ export function createServer(opts: ServerOptions) {
           finished_at: new Date().toISOString(),
         });
       }
-      if (final) await fireWebhooks(final, opts.webhookUrls, opts.webhookSecret);
+      if (final) await fireWebhooks(final, opts.webhookUrls, opts.webhookSecret, report?.bug_report);
     });
 
     return id;
@@ -118,13 +123,14 @@ export function createServer(opts: ServerOptions) {
     void queue.run(async () => {
       await registry.update(id, { status: "running", started_at: new Date().toISOString() });
       let final: RunRecord | null = null;
+      let report: EnrichedReport | null = null;
       try {
         const author = await authorPlan(args);
         await writeFile(join(registry.runDir(id), "plan.md"), author.planMd);
         const meta = extractFromPlan(author.planMd);
         if (meta.name) await registry.update(id, { plan_name: meta.name });
 
-        const report: RunReport = await runPlanFromString(author.planMd, {
+        report = await runPlanFromString(author.planMd, {
           outDir: registry.runDir(id),
           headed: runOpts.headed,
         });
@@ -136,13 +142,13 @@ export function createServer(opts: ServerOptions) {
           finished_at: new Date().toISOString(),
         });
       }
-      if (final) await fireWebhooks(final, opts.webhookUrls, opts.webhookSecret);
+      if (final) await fireWebhooks(final, opts.webhookUrls, opts.webhookSecret, report?.bug_report);
     });
 
     return id;
   }
 
-  function summariseReport(report: RunReport): Partial<RunRecord> {
+  function summariseReport(report: EnrichedReport): Partial<RunRecord> {
     return {
       status: report.passed ? "passed" : "failed",
       passed: report.passed,
@@ -466,10 +472,47 @@ export function createServer(opts: ServerOptions) {
     `);
   });
 
+  const scheduler = createScheduler();
+
+  /** Scan plansDir for plans with `cron:` in frontmatter and arm them. */
+  async function loadScheduledPlans(): Promise<number> {
+    if (!opts.plansDir) return 0;
+    let armed = 0;
+    try {
+      const files = (await readdir(opts.plansDir)).filter((n) => n.endsWith(".md"));
+      for (const f of files) {
+        const path = join(opts.plansDir, f);
+        try {
+          const md = await readFile(path, "utf8");
+          const plan = parsePlan(md, path);
+          if (!plan.cron) continue;
+          const sched = parseSchedule(plan.cron);
+          if (!sched) {
+            console.warn(`[scheduler] ${f}: unrecognised cron expression "${plan.cron}" — skipping`);
+            continue;
+          }
+          scheduler.register(`plan:${f}`, sched, async () => {
+            console.log(`[scheduler] firing ${f} (${sched.expression})`);
+            await enqueueRunFromPlan(md);
+          });
+          armed++;
+        } catch (e) {
+          console.warn(`[scheduler] ${f}: ${(e as Error).message} — skipping`);
+        }
+      }
+    } catch (e) {
+      console.warn(`[scheduler] could not read plansDir ${opts.plansDir}: ${(e as Error).message}`);
+    }
+    return armed;
+  }
+
+  app.get("/v1/schedule", (c) => c.json({ data: scheduler.list() }));
+
   return {
     app,
     async start(): Promise<void> {
       await registry.init();
+      const armed = await loadScheduledPlans();
       serve({ fetch: app.fetch, port: opts.port });
       console.log(`luna-orbit · listening on http://127.0.0.1:${opts.port}`);
       console.log(`  dashboard:  http://127.0.0.1:${opts.port}/`);
@@ -477,6 +520,9 @@ export function createServer(opts: ServerOptions) {
       console.log(`  data dir:   ${opts.dataDir}`);
       console.log(`  auth:       ${opts.apiKeys.length > 0 ? `${opts.apiKeys.length} key(s) required for /v1/*` : "OPEN — set LUNA_ORBIT_API_KEYS for production"}`);
       console.log(`  parallel:   ${opts.maxConcurrent}`);
+      if (opts.plansDir) {
+        console.log(`  scheduler:  ${armed} plan(s) armed from ${opts.plansDir}`);
+      }
     },
   };
 }

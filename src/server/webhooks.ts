@@ -17,12 +17,15 @@
  */
 import { createHmac } from "node:crypto";
 import type { RunRecord } from "./runs.js";
+import type { BugReport } from "../bugreport.js";
 
 export interface WebhookPayload {
   event: "run.completed";
   run: RunRecord;
   /** Convenience: pre-rendered one-liner suitable for Slack/Discord. */
   summary: string;
+  /** AI-generated bug report (only present when status === "failed" or "errored"). */
+  bug_report?: BugReport;
   /** ISO timestamp this webhook was emitted (not when the run finished). */
   emitted_at: string;
 }
@@ -46,20 +49,22 @@ function isDiscordUrl(u: string): boolean {
 
 function shapeFor(url: string, payload: WebhookPayload): unknown {
   if (isSlackUrl(url)) {
-    return { text: payload.summary, blocks: [{ type: "section", text: { type: "mrkdwn", text: `*Luna Orbit*  ${payload.summary}` } }] };
+    const text = payload.summary + (payload.bug_report ? `\n_${payload.bug_report.summary}_\n*Suggested fix:* ${payload.bug_report.suggested_fix}` : "");
+    return { text, blocks: [{ type: "section", text: { type: "mrkdwn", text: `*Luna Orbit*  ${text}` } }] };
   }
   if (isDiscordUrl(url)) {
-    return { content: `**Luna Orbit** ${payload.summary}` };
+    return { content: `**Luna Orbit** ${payload.summary}${payload.bug_report ? `\n> ${payload.bug_report.summary}\n> Fix: ${payload.bug_report.suggested_fix}` : ""}` };
   }
   return payload;
 }
 
-export async function fireWebhooks(rec: RunRecord, urls: string[], secret?: string): Promise<void> {
+export async function fireWebhooks(rec: RunRecord, urls: string[], secret?: string, bugReport?: BugReport): Promise<void> {
   if (urls.length === 0) return;
   const payload: WebhookPayload = {
     event: "run.completed",
     run: rec,
     summary: buildSummary(rec),
+    bug_report: bugReport,
     emitted_at: new Date().toISOString(),
   };
   await Promise.allSettled(urls.map(async (url) => {

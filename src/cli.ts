@@ -6,7 +6,7 @@
  *   luna-orbit serve [--port 8780] [--data-dir ./orbit-data] [--max-parallel 2]
  *   orbit run plans/sample.md
  */
-import { runPlan, authorPlan, authorAndRun } from "./index.js";
+import { runPlan, authorPlan, authorAndRun, captureFixture } from "./index.js";
 import { createServer } from "./server/index.js";
 import { writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -32,10 +32,15 @@ Usage:
                                                  # AI-NATIVE: write the plan, run it, report
   luna-orbit author  --target <URL> --requirement "<plain English>" [--save <plan.md>]
                                                  # write a plan from a requirement, do not run
-  luna-orbit run <plan.md> [--out <dir>] [--headed]
+  luna-orbit run     <plan.md> [--out <dir>] [--headed]
                                                  # run an existing plan
-  luna-orbit serve [--port N] [--data-dir DIR] [--max-parallel N]
-                                                 # HTTP API + tiny dashboard
+  luna-orbit login   --target <URL> --save <fixture.json>
+                                                 # capture cookies after manual login → reuse via plan.auth
+  luna-orbit serve   [--port N] [--data-dir DIR] [--max-parallel N]
+                                                 # HTTP API + dashboard (+ scheduler if any plan has cron:)
+  luna-orbit monitor <plans-dir> [--port N]      # alias for serve that auto-loads plans for cron scheduling
+  luna-orbit record  --target <URL> --save <plan.md>           [v0.4 — coming soon]
+  luna-orbit run-changed --base main [--plans <dir>]           [v0.4 — coming soon]
   orbit run <plan.md>                            # short alias
 
 Env vars:
@@ -141,6 +146,45 @@ async function cmdAuto(argv: string[]) {
   process.exit(report.passed ? 0 : 1);
 }
 
+async function cmdLogin(argv: string[]) {
+  const target = flagValue(argv, "--target");
+  const save = flagValue(argv, "--save");
+  if (!target || !save) {
+    console.error("luna-orbit login: --target <URL> and --save <fixture.json> are required");
+    process.exit(1);
+  }
+  console.log(`luna-orbit · capturing auth fixture from ${target}`);
+  const fix = await captureFixture(target, save);
+  console.log(`\n  saved → ${save}  (${fix.cookies?.length ?? 0} cookies, final URL: ${fix.meta?.final_url ?? "?"})`);
+  console.log(`  use it in a plan:\n    ---\n    auth: ${save}\n    target: ${fix.meta?.final_url ?? target}\n    ---`);
+  process.exit(0);
+}
+
+async function cmdMonitor(argv: string[]) {
+  // monitor = serve with --plans-dir, which the server auto-scans for cron-equipped plans.
+  const port = Number(flagValue(argv, "--port") ?? process.env.LUNA_ORBIT_PORT ?? "8780");
+  const dataDir = flagValue(argv, "--data-dir") ?? process.env.LUNA_ORBIT_DATA_DIR ?? "./orbit-data";
+  const plansDir = argv.find((a) => !a.startsWith("--")) ?? process.env.LUNA_ORBIT_PLANS_DIR;
+  if (!plansDir) {
+    console.error("luna-orbit monitor: provide a plans directory: `luna-orbit monitor ./plans`");
+    process.exit(1);
+  }
+  const apiKeys = (process.env.LUNA_ORBIT_API_KEYS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const webhookUrls = (process.env.LUNA_ORBIT_WEBHOOKS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const webhookSecret = process.env.LUNA_ORBIT_WEBHOOK_SECRET || undefined;
+  const server = createServer({ port, dataDir, maxConcurrent: 1, apiKeys, webhookUrls, webhookSecret, plansDir });
+  await server.start();
+}
+
+function v04Stub(name: string): never {
+  console.error(`luna-orbit ${name}: stubbed in v0.3 — coming in v0.4.
+
+The CLI surface is reserved so your scripts won't break when the real
+implementation lands. Track progress: https://github.com/BitCodeHub/luna-orbit/issues
+`);
+  process.exit(2);
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
@@ -149,6 +193,10 @@ async function main() {
   if (cmd === "serve") return cmdServe(rest);
   if (cmd === "author") return cmdAuthor(rest);
   if (cmd === "auto") return cmdAuto(rest);
+  if (cmd === "login") return cmdLogin(rest);
+  if (cmd === "monitor") return cmdMonitor(rest);
+  if (cmd === "record") return v04Stub("record");
+  if (cmd === "run-changed") return v04Stub("run-changed");
   usage();
 }
 

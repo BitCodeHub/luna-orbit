@@ -5,7 +5,7 @@
  *   const report = await runPlan("plans/sample.md", { outDir: "./orbit-out" });
  *   if (!report.passed) process.exit(1);
  */
-import { join } from "node:path";
+import { join, isAbsolute, resolve } from "node:path";
 import { mkdir } from "node:fs/promises";
 import { loadPlan, parsePlan, type Plan } from "./plan.js";
 import { WebDriver } from "./drivers/web.js";
@@ -13,6 +13,10 @@ import { MobileDriver } from "./drivers/mobile.js";
 import type { Driver } from "./drivers/types.js";
 import { runIntent, checkAssertion } from "./agent.js";
 import { writeReport, type RunReport } from "./report.js";
+import { applyFixture } from "./auth-fixture.js";
+import { compareToBaseline, type VisualVerdict } from "./visual.js";
+import { diagnoseFlake, summariseAttempt, type FlakeNote } from "./flake.js";
+import { generateBugReport, type BugReport } from "./bugreport.js";
 
 export { loadPlan, parsePlan } from "./plan.js";
 export type { Plan } from "./plan.js";
@@ -22,24 +26,107 @@ export { MobileDriver } from "./drivers/mobile.js";
 export type { RunReport } from "./report.js";
 export { authorPlan, authorAndRun } from "./author.js";
 export type { AuthorOptions, AuthorResult } from "./author.js";
+export { captureFixture } from "./auth-fixture.js";
+export type { AuthFixture } from "./auth-fixture.js";
+export { compareToBaseline } from "./visual.js";
+export type { VisualVerdict } from "./visual.js";
+export { generateBugReport, renderBugReportMarkdown } from "./bugreport.js";
+export type { BugReport } from "./bugreport.js";
+export { parseSchedule, createScheduler } from "./scheduling.js";
+export type { Schedule, Scheduler } from "./scheduling.js";
 
 export interface RunOptions {
-  /** Where screenshots + report.html + report.json go. Default: ./qa-pilot-out/<timestamp>. */
+  /** Where screenshots + report.html + report.json go. Default: ./orbit-out/<timestamp>. */
   outDir?: string;
   /** Headed browser (web only). Default: false (headless). */
   headed?: boolean;
 }
 
-export async function runPlanFromString(source: string, opts: RunOptions = {}): Promise<RunReport> {
-  return runPlanInternal(parsePlan(source), opts);
+/**
+ * Augmented report — superset of RunReport with the v0.3 attachments
+ * (visual verdicts, flake diagnosis, AI bug report). All optional.
+ */
+export type EnrichedReport = RunReport & {
+  flake?: FlakeNote;
+  visual?: VisualVerdict;
+  bug_report?: BugReport;
+};
+
+export async function runPlanFromString(source: string, opts: RunOptions = {}): Promise<EnrichedReport> {
+  return runPlanWithExtras(parsePlan(source), opts);
 }
 
-export async function runPlan(planPath: string, opts: RunOptions = {}): Promise<RunReport> {
+export async function runPlan(planPath: string, opts: RunOptions = {}): Promise<EnrichedReport> {
   const plan = await loadPlan(planPath);
-  return runPlanInternal(plan, opts);
+  return runPlanWithExtras(plan, opts);
 }
 
-async function runPlanInternal(plan: Plan, opts: RunOptions): Promise<RunReport> {
+/**
+ * Wrapper around the core run loop that adds:
+ *  - auth fixture pre-load (plan.auth)
+ *  - retry/flake handling (plan.retry → re-runs on fail; LLM diagnoses flake)
+ *  - visual diff vs baseline (plan.visualBaseline)
+ *  - AI-generated bug report on final failure
+ */
+async function runPlanWithExtras(plan: Plan, opts: RunOptions): Promise<EnrichedReport> {
+  const maxAttempts = (plan.retry ?? 0) + 1;
+  const attempts: RunReport[] = [];
+  let final: RunReport | null = null;
+
+  for (let i = 0; i < maxAttempts; i++) {
+    const attemptOpts = i === 0
+      ? opts
+      : { ...opts, outDir: opts.outDir ? `${opts.outDir}-retry${i}` : undefined };
+    const report = await runOnce(plan, attemptOpts);
+    attempts.push(report);
+    final = report;
+    if (report.passed) break; // success on this attempt — stop retrying
+  }
+
+  if (!final) throw new Error("luna-orbit: no attempts ran");
+
+  const enriched: EnrichedReport = { ...final };
+
+  // ── Flake diagnosis (only when later attempts disagreed with earlier) ──
+  if (attempts.length > 1) {
+    const flake: FlakeNote = {
+      attempts: attempts.length,
+      flaked: final.passed && attempts.slice(0, -1).some((a) => !a.passed),
+      attempt_results: attempts.map(summariseAttempt),
+    };
+    if (flake.flaked) {
+      flake.diagnosis = await diagnoseFlake(attempts);
+    }
+    enriched.flake = flake;
+  }
+
+  // ── Visual diff vs baseline ──────────────────────────────────────
+  if (plan.visualBaseline && final.finalScreenshot) {
+    const baselinePath = isAbsolute(plan.visualBaseline)
+      ? plan.visualBaseline
+      : (plan.sourcePath ? resolve(plan.sourcePath, "..", plan.visualBaseline) : resolve(plan.visualBaseline));
+    try {
+      enriched.visual = await compareToBaseline(baselinePath, final.finalScreenshot, plan.name);
+      if (enriched.visual.verdict === "broken" && enriched.passed) {
+        enriched.passed = false; // hard fail on visual regression
+      }
+    } catch (e) {
+      enriched.visual = { verdict: "drifted", reason: `Could not compare: ${(e as Error).message}`, baseline_path: baselinePath, current_path: final.finalScreenshot };
+    }
+  }
+
+  // ── AI bug report on failure ─────────────────────────────────────
+  if (!enriched.passed) {
+    try {
+      const br = await generateBugReport(plan, final);
+      if (br) enriched.bug_report = br;
+    } catch { /* never let bug-report-gen errors fail the run */ }
+  }
+
+  return enriched;
+}
+
+async function runOnce(plan: Plan, opts: RunOptions): Promise<RunReport> {
   const startedAt = new Date();
   const outDir = opts.outDir ?? join(process.cwd(), "orbit-out", startedAt.toISOString().replace(/[:.]/g, "-"));
   await mkdir(join(outDir, "screenshots"), { recursive: true });
@@ -55,6 +142,20 @@ async function runPlanInternal(plan: Plan, opts: RunOptions): Promise<RunReport>
 
   await driver.start();
   if (plan.target) await driver.open(plan.target);
+
+  // Apply auth fixture (web only — mobile auth is a v0.4 thing).
+  if (plan.auth && plan.platform === "web") {
+    const fixturePath = isAbsolute(plan.auth)
+      ? plan.auth
+      : (plan.sourcePath ? resolve(plan.sourcePath, "..", plan.auth) : resolve(plan.auth));
+    try {
+      await applyFixture(fixturePath);
+      // Re-open target so the auth applies on a fresh page load.
+      if (plan.target) await driver.open(plan.target);
+    } catch (e) {
+      console.error(`[auth] failed to apply fixture ${plan.auth}:`, (e as Error).message);
+    }
+  }
 
   const intents: RunReport["intents"] = [];
   for (let i = 0; i < plan.intents.length; i++) {
