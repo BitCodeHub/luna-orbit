@@ -1,0 +1,30 @@
+# docker-compose up
+#
+# Brings up Luna Orbit on http://localhost:8780/ with a persistent volume
+# for the SQLite DB + screenshots. Set LUNA_ORBIT_PUBLIC_URL when exposing
+# the widget script externally so embedders point at the right host.
+
+services:
+  luna-orbit:
+    build: .
+    image: lumen/luna-orbit:0.4
+    container_name: luna-orbit
+    restart: unless-stopped
+    ports:
+      - "8780:8780"
+    volumes:
+      - luna-data:/data
+    environment:
+      LUNA_ORBIT_PORT: "8780"
+      LUNA_ORBIT_DATA_DIR: /data
+      LUNA_ORBIT_MAX_PARALLEL: "2"
+      # When fronted by a reverse proxy with HTTPS, set this so widget snippets
+      # in the dashboard point at the public URL:
+      # LUNA_ORBIT_PUBLIC_URL: https://lunaorbit.example.com
+      # Cloud LLM example (overrides the default lunalabs Tailscale endpoint):
+      # LUNA_ORBIT_LLM_BASE_URL: https://api.anthropic.com/v1
+      # LUNA_ORBIT_LLM_MODEL: claude-sonnet-4
+      # LUNA_ORBIT_LLM_API_KEY: sk-ant-...
+
+volumes:
+  luna-data:

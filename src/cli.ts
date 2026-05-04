@@ -89,11 +89,11 @@ async function cmdServe(argv: string[]) {
   const port = Number(flagValue(argv, "--port") ?? process.env.LUNA_ORBIT_PORT ?? "8780");
   const dataDir = flagValue(argv, "--data-dir") ?? process.env.LUNA_ORBIT_DATA_DIR ?? "./orbit-data";
   const maxConcurrent = Number(flagValue(argv, "--max-parallel") ?? process.env.LUNA_ORBIT_MAX_PARALLEL ?? "2");
-  const apiKeys = (process.env.LUNA_ORBIT_API_KEYS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   const webhookUrls = (process.env.LUNA_ORBIT_WEBHOOKS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   const webhookSecret = process.env.LUNA_ORBIT_WEBHOOK_SECRET || undefined;
+  const publicBaseUrl = process.env.LUNA_ORBIT_PUBLIC_URL || undefined;
 
-  const server = createServer({ port, dataDir, maxConcurrent, apiKeys, webhookUrls, webhookSecret });
+  const server = createServer({ port, dataDir, maxConcurrent, webhookUrls, webhookSecret, publicBaseUrl });
   await server.start();
 }
 
@@ -169,10 +169,10 @@ async function cmdMonitor(argv: string[]) {
     console.error("luna-orbit monitor: provide a plans directory: `luna-orbit monitor ./plans`");
     process.exit(1);
   }
-  const apiKeys = (process.env.LUNA_ORBIT_API_KEYS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   const webhookUrls = (process.env.LUNA_ORBIT_WEBHOOKS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   const webhookSecret = process.env.LUNA_ORBIT_WEBHOOK_SECRET || undefined;
-  const server = createServer({ port, dataDir, maxConcurrent: 1, apiKeys, webhookUrls, webhookSecret, plansDir });
+  const publicBaseUrl = process.env.LUNA_ORBIT_PUBLIC_URL || undefined;
+  const server = createServer({ port, dataDir, maxConcurrent: 1, webhookUrls, webhookSecret, plansDir, publicBaseUrl });
   await server.start();
 }
 

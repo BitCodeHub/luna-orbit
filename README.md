@@ -152,14 +152,46 @@ hma_entry: dealer_onboarding_myh.py
 ## CLI
 
 ```bash
-# One-shot: run a plan, print PASS/FAIL, exit
+# AI-native one-shot: describe what to test, Luna writes & runs it
+luna-orbit auto --target https://shop.example.com --requirement "Verify checkout works"
+
+# Have Luna author a plan, save to disk
+luna-orbit author --target https://shop.example.com --requirement "..." --save plan.md
+
+# Run an existing plan
 luna-orbit run plans/checkout.md --out ./orbit-out
 luna-orbit run plans/checkout.md --headed   # see the browser window
-orbit run plans/checkout.md                 # short alias
 
-# Long-lived: HTTP API + tiny dashboard at /
+# Capture cookies for an authenticated app
+luna-orbit login --target https://app.example.com --save fixtures/admin.json
+
+# Long-lived SaaS server: signup, login, multi-user dashboard, API + widget
 luna-orbit serve --port 8780 --data-dir ./orbit-data --max-parallel 2
+
+# Scheduled monitoring (auto-load all plans with `cron:` from a directory)
+luna-orbit monitor ./plans --port 8780
+
+# Short alias
+orbit run plans/checkout.md
 ```
+
+## Self-host the SaaS (`docker-compose up`)
+
+```bash
+git clone https://github.com/BitCodeHub/luna-orbit
+cd luna-orbit
+docker-compose up
+# → http://localhost:8780/  (signup → onboarding → dashboard)
+```
+
+In v0.4 SaaS mode you get:
+- **Multi-user accounts** — signup / login / sessions, bcrypt-hashed passwords
+- **Per-user workspaces** with plan tiers (free/pro/team/enterprise) + monthly run quotas
+- **Per-workspace API keys** — generate / revoke from the settings page
+- **Onboarding wizard** — first-run flow with 5 test templates so a non-engineer can run their first AI test in 30 seconds
+- **Embeddable widget** — drop `<script src=".../widget.js" data-key="lo_pk_..."></script>` into any web app, get a "AI test this page" button in the corner
+
+Behind a public URL: set `LUNA_ORBIT_PUBLIC_URL=https://lunaorbit.your-domain.com` so the widget snippet in the dashboard renders the right host. Put it behind your VPN/Cloudflare Access/Tailscale Funnel for production.
 
 `run` exits **0** on pass, **1** on test failure, **2** on crash.
 

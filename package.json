@@ -1,6 +1,6 @@
 {
   "name": "luna-orbit",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Luna Orbit — AI-powered autonomous regression testing SDK. Drop into any web app (Playwright) or mobile app (Appium). Describe flows in plain English, the agent drives a real browser/device, self-heals, screenshots, and reports.",
   "license": "MIT",
   "keywords": [
@@ -41,10 +41,14 @@
     "agent-browser": "^0.26.0",
     "webdriverio": "^9.0.0",
     "hono": "^4.6.0",
-    "@hono/node-server": "^1.13.0"
+    "@hono/node-server": "^1.13.0",
+    "better-sqlite3": "^11.5.0",
+    "bcryptjs": "^2.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.7.4",
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/bcryptjs": "^2.4.6",
     "typescript": "^5.6.3",
     "vitest": "^2.1.0"
   }
